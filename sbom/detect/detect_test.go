@@ -21,29 +21,72 @@ import (
 
 	stereoscopeimage "github.com/anchore/stereoscope/pkg/image"
 	"github.com/anchore/syft/syft/source"
+
 	"github.com/docker/cli/cli/command"
+	"github.com/docker/cli/cli/flags"
 	"github.com/docker/index-cli-plugin/registry"
 	"github.com/docker/index-cli-plugin/types"
 )
 
 func TestNodeDetector(t *testing.T) {
 	cmd, _ := command.NewDockerCli()
-	_, ociPath, _ := registry.SaveImage("node@sha256:2b00d259f3b07d8aa694b298a7dcf4655571aea2ab91375b5adb8e5a905d3ee2", cmd.Client())
+	err := cmd.Initialize(flags.NewClientOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache, _ := registry.SaveImage("atomist/skill@sha256:a691a1ccfa81ab7cc6b422a53bfb9bbcea4d78873426b0389eec8f554da9b0b8", "", "", cmd)
+	err = cache.StoreImage()
+	if err != nil {
+		t.Fatal(err)
+	}
 	lm := types.LayerMapping{
 		ByDiffId: make(map[string]string),
 	}
 	i := source.Input{
 		Scheme:      source.ImageScheme,
 		ImageSource: stereoscopeimage.OciDirectorySource,
-		Location:    ociPath,
+		Location:    cache.ImagePath,
 	}
-	src, _, _ := source.New(i, nil, nil)
-	packages := nodePackageDetector([]types.Package{}, *src, lm)
+	src, _, err := source.New(i, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	packages := nodePackageDetector()([]types.Package{}, src, &lm)
 	if len(packages) != 1 {
 		t.Errorf("Expected package missing")
 	}
 	node := packages[0]
-	if node.Purl != "pkg:github/nodejs/node@19.0.0" {
-		t.Errorf("Wrong nodejs version detected")
+	if node.Purl != "pkg:github/nodejs/node@16.14.2" {
+		t.Errorf("Wrong nodejs version detected %s", node.Version)
+	}
+}
+
+func TestPythonDetector(t *testing.T) {
+	cmd, _ := command.NewDockerCli()
+	err := cmd.Initialize(flags.NewClientOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache, _ := registry.SaveImage("atomist/skill@sha256:a691a1ccfa81ab7cc6b422a53bfb9bbcea4d78873426b0389eec8f554da9b0b8", "", "", cmd)
+	err = cache.StoreImage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lm := types.LayerMapping{
+		ByDiffId: make(map[string]string),
+	}
+	i := source.Input{
+		Scheme:      source.ImageScheme,
+		ImageSource: stereoscopeimage.OciDirectorySource,
+		Location:    cache.ImagePath,
+	}
+	src, _, err := source.New(i, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	packages := pythonPackageDetector()([]types.Package{}, src, &lm)
+	if len(packages) != 0 {
+		t.Errorf("Nnot expected package")
 	}
 }

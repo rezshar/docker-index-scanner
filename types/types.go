@@ -16,7 +16,9 @@
 
 package types
 
-import v1 "github.com/google/go-containerregistry/pkg/v1"
+import (
+	v1 "github.com/google/go-containerregistry/pkg/v1"
+)
 
 type Score struct {
 	Type  string `edn:"vulnerability.reference.score/type" json:"type"`
@@ -69,9 +71,16 @@ type LayerMapping struct {
 type IndexResult struct {
 	Name     string
 	Packages []Package
+	Secrets  []Secret
 	Status   string
 	Error    error
 	Distro   Distro
+}
+
+type BaseImagesResult struct {
+	BaseImages []BaseImage
+	Status     string
+	Error      error
 }
 
 const (
@@ -92,22 +101,24 @@ type Platform struct {
 }
 
 type Location struct {
-	Path   string `json:"path"`
-	Digest string `json:"digest"`
-	DiffId string `json:"diff_id"`
+	Path    string `json:"path,omitempty"`
+	Ordinal int    `json:"ordinal,omitempty"`
+	Digest  string `json:"digest,omitempty"`
+	DiffId  string `json:"diff_id,omitempty"`
 }
 
 type ImageSource struct {
 	Name        string         `json:"name"`
 	Digest      string         `json:"digest"`
 	Tags        *[]string      `json:"tags,omitempty"`
-	Manifest    *v1.Manifest   `json:"manifest"`
-	Config      *v1.ConfigFile `json:"config"`
+	Manifest    *v1.Manifest   `json:"manifest,omitempty"`
+	Config      *v1.ConfigFile `json:"config,omitempty"`
 	RawManifest string         `json:"raw_manifest"`
 	RawConfig   string         `json:"raw_config"`
 	Distro      Distro         `json:"distro"`
 	Platform    Platform       `json:"platform"`
 	Size        int64          `json:"size"`
+	Details     *BaseImage     `json:"details,omitempty"`
 }
 
 type Descriptor struct {
@@ -117,15 +128,37 @@ type Descriptor struct {
 }
 
 type Source struct {
-	Type  string      `json:"type"`
-	Image ImageSource `json:"image"`
+	Type       string           `json:"type"`
+	Image      ImageSource      `json:"image"`
+	BaseImages []BaseImageMatch `json:"base_images,omitempty"`
+}
+
+type Secret struct {
+	Source   SecretSource    `json:"source"`
+	Findings []SecretFinding `json:"findings"`
+}
+
+type SecretSource struct {
+	Type     string    `json:"type"`
+	Location *Location `json:"location,omitempty"`
+}
+
+type SecretFinding struct {
+	RuleID    string `json:"rule_id"`
+	Category  string `json:"category"`
+	Title     string `json:"title"`
+	Severity  string `json:"severity"`
+	StartLine int    `json:"start_line,omitempty"`
+	EndLine   int    `json:"end_line,omitempty"`
+	Match     string `json:"match"`
 }
 
 type Sbom struct {
-	Source          Source     `json:"source"`
-	Artifacts       []Package  `json:"artifacts"`
-	Vulnerabilities []Cve      `json:"vulnerabilities,omitempty"`
-	Descriptor      Descriptor `json:"descriptor"`
+	Source          Source                  `json:"source"`
+	Artifacts       []Package               `json:"artifacts"`
+	Vulnerabilities []VulnerabilitiesByPurl `json:"vulnerabilities,omitempty"`
+	Secrets         []Secret                `json:"secrets,omitempty"`
+	Descriptor      Descriptor              `json:"descriptor"`
 }
 
 type Package struct {

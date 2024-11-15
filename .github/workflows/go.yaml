@@ -19,7 +19,10 @@ jobs:
         go-version: 1.19
 
     - name: Build
-      run: go build -v
+      run: go build -v ./cmd/docker-index
 
     - name: Test
-      run: go test -v
+      run: go test -v ./...
+
+    - name: Lint
+      run: docker run --rm -v $(pwd):/app -v $(go env GOPATH)/pkg:/go/pkg -v $(go env GOCACHE):/cache/go -e GOCACHE=/cache/go -e GOLANGCI_LINT_CACHE=/cache/go -w /app golangci/golangci-lint:v1.50.1 golangci-lint run -v --timeout 10m

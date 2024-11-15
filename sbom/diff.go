@@ -21,49 +21,19 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/anchore/packageurl-go"
-	"github.com/docker/docker/client"
-	"github.com/docker/index-cli-plugin/internal"
-	"github.com/docker/index-cli-plugin/types"
-	"github.com/gookit/color"
 	"github.com/jedib0t/go-pretty/v6/table"
 	"github.com/jedib0t/go-pretty/v6/text"
+
+	"github.com/docker/cli/cli/command"
+	"github.com/docker/index-cli-plugin/types"
 )
 
-type colors struct {
-	critical    color.RGBColor
-	high        color.RGBColor
-	medium      color.RGBColor
-	low         color.RGBColor
-	unspecified color.RGBColor
-
-	removed color.Color
-	added   color.Color
-	changed color.Color
-}
-
-var defaultColors *colors
-
-func init() {
-	defaultColors = &colors{
-		critical:    color.HEX("D52536"),
-		high:        color.HEX("DD7805"),
-		medium:      color.HEX("FBB552"),
-		low:         color.HEX("FCE1A9"),
-		unspecified: color.HEX("E9ECEF"),
-
-		removed: color.Green,
-		added:   color.Red,
-		changed: color.Yellow,
-	}
-}
-
-func DiffImages(image1 string, image2 string, client client.APIClient, workspace string, apikey string) error {
+func DiffImages(image1 string, image2 string, cli command.Cli, workspace string, apikey string) error {
 	resultChan := make(chan ImageIndexResult, 2)
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go indexImageAsync(&wg, image1, client, resultChan)
-	go indexImageAsync(&wg, image2, client, resultChan)
+	go indexImageAsync(&wg, image1, IndexOptions{Cli: cli}, resultChan)
+	go indexImageAsync(&wg, image2, IndexOptions{Cli: cli}, resultChan)
 	wg.Wait()
 	close(resultChan)
 
@@ -78,7 +48,7 @@ func DiffImages(image1 string, image2 string, client client.APIClient, workspace
 	}
 
 	diffPackages(result1, result2)
-	diffCves(result1, result2)
+	// diffCves(result1, result2)
 	return nil
 }
 
@@ -90,22 +60,10 @@ func toPackageKey(pkg types.Package) string {
 	}
 }
 
-func toPackageName(pkg packageurl.PackageURL) string {
-	if pkg.Namespace != "" {
-		return fmt.Sprintf("%s/%s/%s", pkg.Type, pkg.Namespace, pkg.Name)
-	} else {
-		return fmt.Sprintf("%s/%s", pkg.Type, pkg.Name)
-	}
-}
-
 func toImageName(result ImageIndexResult) string {
 	imageName := result.Sbom.Source.Image.Name
-	if strings.HasPrefix(imageName, "index.docker.io/") {
-		imageName = imageName[len("index.docker.io/"):]
-	}
-	if strings.HasPrefix(imageName, "library/") {
-		imageName = imageName[len("library/"):]
-	}
+	imageName = strings.TrimPrefix(imageName, "index.docker.io/")
+	imageName = strings.TrimPrefix(imageName, "library/")
 	return imageName
 }
 
@@ -227,73 +185,12 @@ func diffPackages(result1, result2 ImageIndexResult) {
 	}
 }
 
-type CveEntry struct {
+/*type CveEntry struct {
 	image1 []types.Cve
 	image2 []types.Cve
 }
 
 type CveMap map[string]CveEntry
-
-func colorizeSeverity(severity string) string {
-	switch severity {
-	case "CRITICAL":
-		return defaultColors.critical.Sprintf(severity)
-	case "HIGH":
-		return defaultColors.high.Sprintf(severity)
-	case "MEDIUM":
-		return defaultColors.medium.Sprintf(severity)
-	case "LOW":
-		return defaultColors.low.Sprintf(severity)
-	default:
-		return severity
-	}
-}
-
-func toSeverity(cve types.Cve) string {
-	findSeverity := func(adv *types.Advisory) (string, bool) {
-		if adv == nil {
-			return "", false
-		}
-		for _, r := range (*adv).References {
-			if r.Source == "atomist" {
-				for _, s := range r.Scores {
-					if s.Type == "atm_severity" {
-						v := s.Value
-						if v != "SEVERITY_UNSPECIFIED" {
-							return v, true
-						}
-					}
-				}
-			}
-		}
-		return "", false
-	}
-
-	if severity, ok := findSeverity(cve.Cve); ok {
-		return severity
-	}
-	if severity, ok := findSeverity(cve.Advisory); ok {
-		return severity
-	}
-
-	return "IN TRIAGE"
-}
-
-func toSeverityInt(cve types.Cve) int {
-	severity := toSeverity(cve)
-	switch severity {
-	case "CRITICAL":
-		return 4
-	case "HIGH":
-		return 3
-	case "MEDIUM":
-		return 2
-	case "LOW":
-		return 1
-	default:
-		return 0
-	}
-}
 
 func diffCves(result1, result2 ImageIndexResult) {
 	dc := 0
@@ -371,7 +268,7 @@ func diffCves(result1, result2 ImageIndexResult) {
 			} else if len(c1) == 0 {
 				cl = defaultColors.added.Sprintf(k)
 			}
-			t.AppendRow(table.Row{k, toSeverityInt(cve), cl, colorizeSeverity(toSeverity(cve)), strings.Join(c1, "\n"), strings.Join(c2, "\n")})
+			t.AppendRow(table.Row{k, format.ToSeverityInt(cve), cl, format.ColorizeSeverity(format.ToSeverity(cve)), strings.Join(c1, "\n"), strings.Join(c2, "\n")})
 			dc++
 		}
 	}
@@ -389,4 +286,4 @@ func diffCves(result1, result2 ImageIndexResult) {
 		fmt.Println(t.Render())
 	}
 
-}
+}*/

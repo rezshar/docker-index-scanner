@@ -1,5 +1,5 @@
 # build stage
-FROM golang:1.19-alpine3.16@sha256:0eb08c89ab1b0c638a9fe2780f7ae3ab18f6ecda2c76b908e09eb8073912045d as build
+FROM golang:1.20-alpine3.17 as build
 
 RUN apk add --no-cache git build-base ca-certificates
 
@@ -13,7 +13,7 @@ RUN go mod download
 COPY . ./
 
 # RUN go test
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -trimpath
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -trimpath -o index-cli-plugin ./cmd/docker-index
 
 # runtime stage
 FROM scratch

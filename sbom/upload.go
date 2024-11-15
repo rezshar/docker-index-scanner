@@ -21,9 +21,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/atomist-skills/go-skill"
-	"github.com/docker/index-cli-plugin/internal"
-	"github.com/docker/index-cli-plugin/types"
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/uuid"
@@ -31,24 +28,17 @@ import (
 	"github.com/opencontainers/image-spec/identity"
 	"github.com/pkg/errors"
 	"olympos.io/encoding/edn"
+
+	"github.com/atomist-skills/go-skill"
+
+	"github.com/docker/index-cli-plugin/internal"
+	"github.com/docker/index-cli-plugin/types"
 )
 
-// UploadSbom transact an image and its data into the data plane
-func UploadSbom(sb *types.Sbom, img *v1.Image, workspace string, apikey string) error {
-	host, name, err := parseReference(sb)
-	if err != nil {
-		return errors.Wrapf(err, "failed to obtain host and repository")
-	}
-	config, err := (*img).ConfigFile()
-	if err != nil {
-		return errors.Wrapf(err, "failed to obtain config")
-	}
-	manifest, err := (*img).Manifest()
-	if err != nil {
-		return errors.Wrapf(err, "failed to obtain manifest")
-	}
+type TransactionMaker = func() skill.Transaction
 
-	now := time.Now()
+// UploadSbom transact an image and its data into the data plane
+func Upload(sb *types.Sbom, workspace string, apikey string) error {
 	correlationId := uuid.NewString()
 	context := skill.RequestContext{
 		Event: skill.EventIncoming{
@@ -57,7 +47,47 @@ func UploadSbom(sb *types.Sbom, img *v1.Image, workspace string, apikey string) 
 			Token:       apikey,
 		},
 	}
-	transaction := context.NewTransaction().Ordered()
+
+	newTransaction := context.NewTransaction
+	err := transactSbom(sb, newTransaction)
+	if err != nil {
+		return errors.Wrap(err, "failed to transact image")
+	}
+
+	return nil
+}
+
+func Send(sb *types.Sbom, entities chan<- string) error {
+	correlationId := uuid.NewString()
+	context := skill.RequestContext{
+		Event: skill.EventIncoming{
+			ExecutionId: correlationId,
+		},
+	}
+
+	newTransaction := func() skill.Transaction {
+		return context.NewTransactionWithTransactor(func(entitiesString string) {
+			entities <- entitiesString
+		})
+	}
+	err := transactSbom(sb, newTransaction)
+	if err != nil {
+		return errors.Wrap(err, "failed to transact image")
+	}
+
+	return nil
+}
+
+func transactSbom(sb *types.Sbom, newTransaction func() skill.Transaction) error {
+	now := time.Now()
+	host, name, err := parseReference(sb)
+	if err != nil {
+		return errors.Wrap(err, "failed to obtain host and repository")
+	}
+	config := (*sb).Source.Image.Config
+	manifest := (*sb).Source.Image.Manifest
+
+	transaction := newTransaction().Ordered()
 	ports := parsePorts(config)
 	env, envVars := parseEnvVars(config)
 	sha := parseSha(config)
@@ -65,11 +95,12 @@ func UploadSbom(sb *types.Sbom, img *v1.Image, workspace string, apikey string) 
 	diffIds := diffIdChainIds(config)
 	digests := digestChainIds(manifest)
 
-	repository := RepositoryEntity{
+	repository := skill.MakeEntity(RepositoryEntity{
 		Host:      host,
 		Name:      name,
 		Platforms: skill.ManyRef{Add: []string{parsePlatform(sb)}},
-	}
+	}, "$repo")
+	transaction.AddEntities(repository)
 
 	layers := make([]LayerEntity, 0)
 	lc := 0
@@ -95,11 +126,11 @@ func UploadSbom(sb *types.Sbom, img *v1.Image, workspace string, apikey string) 
 		lc++
 	}
 
-	image := ImageEntity{
+	image := skill.MakeEntity(ImageEntity{
 		Digest:               sb.Source.Image.Digest,
 		CreatedAt:            &config.Created.Time,
-		Repository:           &repository,
-		Repositories:         &[]RepositoryEntity{repository},
+		Repository:           "$repo",
+		Repositories:         &skill.ManyRef{Add: []string{"$repo"}},
 		Labels:               &labels,
 		Ports:                &ports,
 		Env:                  &env,
@@ -107,33 +138,36 @@ func UploadSbom(sb *types.Sbom, img *v1.Image, workspace string, apikey string) 
 		Layers:               &layers,
 		BlobDigest:           digests[len(digests)-1].String(),
 		DiffChainId:          diffIds[len(diffIds)-1].String(),
+	}, "$image")
 
-		SbomVersion:      sb.Descriptor.SbomVersion,
-		SbomState:        Indexing,
-		SbomLastUpdated:  &now,
-		SbomPackageCount: len(sb.Artifacts),
-	}
 	if sha != "" {
 		image.Sha = sha
 	}
 
-	if len(*sb.Source.Image.Tags) > 0 {
+	if sb.Artifacts != nil {
+		image.SbomVersion = sb.Descriptor.SbomVersion
+		image.SbomState = Indexing
+		image.SbomLastUpdated = &now
+		image.SbomPackageCount = len(sb.Artifacts)
+	}
+
+	if sb.Source.Image.Tags != nil && len(*sb.Source.Image.Tags) > 0 {
 		image.Tags = &skill.ManyRef{Add: *sb.Source.Image.Tags}
 
 		for _, t := range *sb.Source.Image.Tags {
 			tag := TagEntity{
 				Name:       t,
 				UpdatedAt:  config.Created.Time,
-				Repository: repository,
+				Repository: "$repo",
 				Digest:     sb.Source.Image.Digest,
-				Image:      image,
+				Image:      "$image",
 			}
 			transaction.AddEntities(tag)
 		}
 	}
 
 	platform := PlatformEntity{
-		Image:        image,
+		Image:        "$image",
 		Os:           sb.Source.Image.Platform.Os,
 		Architecture: sb.Source.Image.Platform.Architecture,
 		Variant:      sb.Source.Image.Platform.Variant,
@@ -148,12 +182,11 @@ func UploadSbom(sb *types.Sbom, img *v1.Image, workspace string, apikey string) 
 	// transact all packages in chunks
 	packageChunks := internal.ChunkSlice(sb.Artifacts, 20)
 	for _, packages := range packageChunks {
-		transaction := context.NewTransaction().Ordered()
+		transaction := newTransaction().Ordered()
 
-		image = ImageEntity{
-			Digest:    sb.Source.Image.Digest,
-			SbomState: Indexing,
-		}
+		image = skill.MakeEntity(ImageEntity{
+			Digest: sb.Source.Image.Digest,
+		}, "$image")
 
 		for _, p := range packages {
 			files := make([]FileEntity, 0)
@@ -181,7 +214,7 @@ func UploadSbom(sb *types.Sbom, img *v1.Image, workspace string, apikey string) 
 
 			dep := DependencyEntity{
 				Scopes:  []string{"provided"},
-				Parent:  image,
+				Parent:  "$image",
 				Package: pkg,
 				Files:   files,
 			}
@@ -196,23 +229,17 @@ func UploadSbom(sb *types.Sbom, img *v1.Image, workspace string, apikey string) 
 		}
 	}
 
-	image = ImageEntity{
+	image = skill.MakeEntity(ImageEntity{
 		Digest:    sb.Source.Image.Digest,
 		SbomState: Indexed,
+	}, "$image")
+	if sb.Artifacts != nil {
+		image.SbomState = Indexed
 	}
-	err = context.NewTransaction().Ordered().AddEntities(image).Transact()
+	err = newTransaction().Ordered().AddEntities(image).Transact()
 	if err != nil {
 		return errors.Wrapf(err, "failed to transact packages")
 	}
-
-	imageName := ""
-	if host != "hub.docker.com" {
-		imageName = host + "/"
-	}
-	imageName += name
-
-	skill.Log.Infof("Inspect image at https://dso.docker.com/%s/overview/images/%s/digests/%s", workspace, imageName, image.Digest)
-
 	return nil
 }
 
@@ -297,27 +324,25 @@ func parseReference(sb *types.Sbom) (string, string, error) {
 		host = "hub.docker.com"
 	}
 	name := ref.Context().RepositoryStr()
-	if strings.HasPrefix(name, "library/") {
-		name = name[len("library/"):]
-	}
+	name = strings.TrimPrefix(name, "library/")
 	return host, name, nil
 }
 
 type PlatformEntity struct {
 	skill.Entity `entity-type:"docker/platform"`
-	Image        ImageEntity `edn:"docker.platform/image"`
-	Os           string      `edn:"docker.platform/os"`
-	Architecture string      `edn:"docker.platform/architecture"`
-	Variant      string      `edn:"docker.platform/variant,omitempty"`
+	Image        string `edn:"docker.platform/image"`
+	Os           string `edn:"docker.platform/os"`
+	Architecture string `edn:"docker.platform/architecture"`
+	Variant      string `edn:"docker.platform/variant,omitempty"`
 }
 
 type TagEntity struct {
 	skill.Entity `entity-type:"docker/tag"`
-	Name         string           `edn:"docker.tag/name"`
-	UpdatedAt    time.Time        `edn:"docker.tag/updated-at"`
-	Repository   RepositoryEntity `edn:"docker.tag/repository"`
-	Digest       string           `edn:"docker.tag/digest"`
-	Image        ImageEntity      `edn:"docker.tag/image"`
+	Name         string    `edn:"docker.tag/name"`
+	UpdatedAt    time.Time `edn:"docker.tag/updated-at"`
+	Repository   string    `edn:"docker.tag/repository"`
+	Digest       string    `edn:"docker.tag/digest"`
+	Image        string    `edn:"docker.tag/image"`
 }
 
 type RepositoryEntity struct {
@@ -362,8 +387,8 @@ type ImageEntity struct {
 	skill.Entity         `entity-type:"docker/image"`
 	Digest               string                       `edn:"docker.image/digest"`
 	CreatedAt            *time.Time                   `edn:"docker.image/created-at,omitempty"`
-	Repository           *RepositoryEntity            `edn:"docker.image/repository,omitempty"`
-	Repositories         *[]RepositoryEntity          `edn:"docker.image/repositories,omitempty"`
+	Repository           string                       `edn:"docker.image/repository,omitempty"`
+	Repositories         *skill.ManyRef               `edn:"docker.image/repositories,omitempty"`
 	Tags                 *skill.ManyRef               `edn:"docker.image/tags,omitempty"`
 	Labels               *[]LabelEntity               `edn:"docker.image/labels,omitempty"`
 	Ports                *[][2]string                 `edn:"docker.image/ports,omitempty"`
@@ -374,7 +399,7 @@ type ImageEntity struct {
 	DiffChainId          string                       `edn:"docker.image/diff-chain-id,omitempty"`
 	Sha                  string                       `edn:"docker.image/sha,omitempty"`
 
-	SbomState        edn.Keyword `edn:"sbom/state"`
+	SbomState        edn.Keyword `edn:"sbom/state,omitempty"`
 	SbomVersion      string      `edn:"sbom/version,omitempty"`
 	SbomLastUpdated  *time.Time  `edn:"sbom/last-updated,omitempty"`
 	SbomPackageCount int         `edn:"sbom/package-count,omitempty"`
@@ -412,7 +437,7 @@ type FileEntity struct {
 type DependencyEntity struct {
 	skill.Entity `entity-type:"package/dependency"`
 	Scopes       []string      `edn:"package.dependency/scopes"`
-	Parent       ImageEntity   `edn:"package.dependency/parent"`
+	Parent       string        `edn:"package.dependency/parent"`
 	Package      PackageEntity `edn:"package.dependency/package"`
 	Files        []FileEntity  `edn:"package.dependency/files"`
 }

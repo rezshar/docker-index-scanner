@@ -22,20 +22,20 @@ import (
 	"github.com/docker/index-cli-plugin/types"
 )
 
-func nodePackageDetector() PackageDetector {
-	expr := regexp.MustCompile(`node\.js/v(.*)`)
+func pythonPackageDetector() PackageDetector {
+	expr := regexp.MustCompile(`libpython(.*)\.so\.`)
 	pkg := types.Package{
 		Type:        "github",
-		Namespace:   "nodejs",
-		Name:        "node",
-		Author:      "Node.js Project",
-		Description: "Node.js JavaScript runtime",
-		Licenses:    []string{"MIT"},
-		Url:         "https://nodejs.org",
+		Namespace:   "python",
+		Name:        "python",
+		Author:      "Python Project",
+		Description: "Python runtime",
+		Licenses:    []string{"PSF"},
+		Url:         "https://python.org",
 	}
 	filter := func(purl string) bool {
 		pkg, _ := types.ToPackageUrl(purl)
-		return pkg.Name == "nodejs"
+		return pkg.Name == "python"
 	}
-	return stringsNodeDetector("node", "NODE_VERSION", expr, pkg, filter)
+	return stringsNodeDetector("python", "PYTHON_VERSION", expr, pkg, filter)
 }

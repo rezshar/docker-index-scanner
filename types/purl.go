@@ -22,6 +22,7 @@ import (
 	"strings"
 
 	"github.com/anchore/packageurl-go"
+
 	"github.com/atomist-skills/go-skill"
 )
 
@@ -40,10 +41,8 @@ func NormalizePackages(pkgs []Package) ([]Package, error) {
 		}
 		purl.Namespace = toNamespace(purl)
 
-		// some versions strings (e.g. such of Go) have a v prefix that we drop
-		if strings.HasPrefix(purl.Version, "v") {
-			purl.Version = purl.Version[1:]
-		}
+		// some version strings (e.g. such of Go) have a v prefix that we drop
+		purl.Version = strings.TrimPrefix(purl.Version, "v")
 		if purl.Version == "" {
 			purl.Version = "0.0.0"
 		}
@@ -55,6 +54,12 @@ func NormalizePackages(pkgs []Package) ([]Package, error) {
 			qualifiers["os_version"] = q["os_version"]
 			if d := q["os_distro"]; d != "" {
 				qualifiers["os_distro"] = d
+			}
+			if d := q["distro_name"]; d != "" {
+				qualifiers["distro_name"] = d
+			}
+			if d := q["distro_version"]; d != "" {
+				qualifiers["distro_version"] = d
 			}
 			purl.Qualifiers = packageurl.QualifiersFromMap(qualifiers)
 		}
@@ -93,11 +98,13 @@ func NormalizePackages(pkgs []Package) ([]Package, error) {
 }
 
 func ToPackageUrl(url string) (packageurl.PackageURL, error) {
-	if strings.HasSuffix(url, "/") {
-		url = url[0 : len(url)-1]
-	}
+	url = strings.TrimSuffix(url, "/")
 	purl, err := packageurl.FromString(url)
 	return purl, err
+}
+
+func PackageToPackageUrl(pkp Package) *packageurl.PackageURL {
+	return packageurl.NewPackageURL(pkp.Type, pkp.Namespace, pkp.Name, pkp.Version, packageurl.QualifiersFromMap(make(map[string]string)), "")
 }
 
 func toNamespace(purl packageurl.PackageURL) string {
@@ -194,6 +201,39 @@ func MergePackages(results ...IndexResult) []Package {
 		return packages[i].Purl < packages[j].Purl
 	})
 	return packages
+}
+
+func FilterGenericPackages(packages []Package) []Package {
+	pkgs := make([]Package, 0)
+	genericPkgs := make([]Package, 0)
+	for _, pkg := range packages {
+		if pkg.Type != "generic" {
+			pkgs = append(pkgs, pkg)
+		} else {
+			genericPkgs = append(genericPkgs, pkg)
+		}
+	}
+	for _, pkg := range genericPkgs {
+		found := false
+		for _, loc := range pkg.Locations {
+			for _, p := range pkgs {
+				if containsLocation(p.Locations, loc.Path) || containsLocation(p.Files, loc.Path) {
+					found = true
+				}
+			}
+		}
+		for _, loc := range pkg.Files {
+			for _, p := range pkgs {
+				if containsLocation(p.Locations, loc.Path) || containsLocation(p.Files, loc.Path) {
+					found = true
+				}
+			}
+		}
+		if !found {
+			pkgs = append(pkgs, pkg)
+		}
+	}
+	return pkgs
 }
 
 func containsPackage(packages *[]Package, pkg Package) (int, bool) {

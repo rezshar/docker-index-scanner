@@ -1,7 +1,7 @@
 version: '3'
 
 vars:
-  IMAGE_NAME: docker/index-cli-plugin:local
+  IMAGE_NAME: docker/docker-index:local
 
 tasks:
   go:test:
@@ -10,7 +10,7 @@ tasks:
 
   go:build:
     cmds:
-      - go build -o docker-index -ldflags="-w -s -X 'github.com/docker/index-cli-plugin/internal.version={{.GIT_COMMIT}}'"
+      - go build -o docker-index -ldflags="-w -s -X 'github.com/docker/index-cli-plugin/internal.version={{.GIT_COMMIT}}'" ./cmd/docker-index
     env:
       CGO_ENABLED: 0
     vars:
@@ -25,9 +25,13 @@ tasks:
 
   go:fmt:
     cmds:
-      - goimports -w .
+      - goimports -w -local github.com/atomist-skills,github.com/docker,github.com/docker/index-cli-plugin .
       - gofmt -w .
       #- go mod tidy
+
+  go:lint:
+    cmds:
+      - docker run --rm -v $(pwd):/app -v $(go env GOPATH)/pkg:/go/pkg -v $(go env GOCACHE):/cache/go -e GOCACHE=/cache/go -e GOLANGCI_LINT_CACHE=/cache/go -w /app golangci/golangci-lint:v1.50.1 golangci-lint run -v --timeout 10m
 
   go:release:
     cmds:

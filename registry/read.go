@@ -17,17 +17,51 @@
 package registry
 
 import (
-	v1 "github.com/google/go-containerregistry/pkg/v1"
+	stereoscopeimage "github.com/anchore/stereoscope/pkg/image"
+	"github.com/anchore/syft/syft/source"
 	"github.com/google/go-containerregistry/pkg/v1/layout"
 	"github.com/pkg/errors"
+
+	"github.com/atomist-skills/go-skill"
 )
 
-func ReadImage(path string) (v1.Image, error) {
+func ReadImage(name string, path string) (*ImageCache, error) {
+	skill.Log.Infof("Loading image from %s", path)
 	index, err := layout.ImageIndexFromPath(path)
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to read manifest index at %s", path)
 	}
 	mani, err := index.IndexManifest()
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to read manifest index at %s", path)
+	}
 	hash := mani.Manifests[0].Digest
-	return index.Image(hash)
+	img, _ := index.Image(hash)
+
+	skill.Log.Debugf("Parsing image")
+	input := source.Input{
+		Scheme:      source.ImageScheme,
+		ImageSource: stereoscopeimage.OciDirectorySource,
+		Location:    path,
+	}
+	src, cleanup, err := source.New(input, nil, nil)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to create new source")
+	}
+	skill.Log.Debugf("Parse image")
+	skill.Log.Infof("Loaded image")
+
+	return &ImageCache{
+		Id:        hash.String(),
+		Digest:    hash.String(),
+		Tags:      []string{},
+		Name:      name,
+		Image:     &img,
+		Source:    src,
+		ImagePath: path,
+		Ref:       nil,
+
+		copy:          false,
+		sourceCleanup: cleanup,
+	}, nil
 }

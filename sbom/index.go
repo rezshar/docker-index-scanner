@@ -24,159 +24,201 @@ import (
 	"strings"
 	"sync"
 
+	v1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/pkg/errors"
+
 	"github.com/atomist-skills/go-skill"
-	"github.com/docker/docker/client"
+
+	"github.com/docker/cli/cli/command"
 	"github.com/docker/index-cli-plugin/internal"
 	"github.com/docker/index-cli-plugin/query"
 	"github.com/docker/index-cli-plugin/registry"
 	"github.com/docker/index-cli-plugin/types"
-	"github.com/google/go-containerregistry/pkg/name"
-	v1 "github.com/google/go-containerregistry/pkg/v1"
-	"github.com/pkg/errors"
 )
 
 type ImageIndexResult struct {
 	Input string
-	Image *v1.Image
 	Sbom  *types.Sbom
 	Error error
 }
 
-func indexImageAsync(wg *sync.WaitGroup, image string, client client.APIClient, resultChan chan<- ImageIndexResult) {
+func indexImageAsync(wg *sync.WaitGroup, image string, options IndexOptions, resultChan chan<- ImageIndexResult) {
 	defer wg.Done()
-	sbom, img, err := IndexImage(image, client)
-	cves, err := query.QueryCves(sbom, "", "", "")
+	var (
+		sbom *types.Sbom
+		cves *types.VulnerabilitiesByPurls
+		err  error
+	)
+	sbom, err = IndexImage(image, options)
 	if err == nil {
-		sbom.Vulnerabilities = *cves
+		cves, err = query.ForVulnerabilitiesInGraphQL(sbom)
+		if err == nil {
+			sbom.Vulnerabilities = cves.VulnerabilitiesByPackage
+		}
 	}
 	resultChan <- ImageIndexResult{
 		Input: image,
-		Image: img,
 		Sbom:  sbom,
 		Error: err,
 	}
 }
 
-func IndexPath(path string, name string) (*types.Sbom, *v1.Image, error) {
-	skill.Log.Infof("Loading image from %s", path)
-	img, err := registry.ReadImage(path)
-	if err != nil {
-		return nil, nil, errors.Wrap(err, "failed to read image")
-	}
-	skill.Log.Infof("Loaded image")
-	return indexImage(img, name, path)
+type IndexOptions struct {
+	Username string
+	Password string
+
+	Cli command.Cli
 }
 
-func IndexImage(image string, client client.APIClient) (*types.Sbom, *v1.Image, error) {
-	skill.Log.Infof("Copying image %s", image)
-	img, path, err := registry.SaveImage(image, client)
+func IndexPath(path string, name string, cli command.Cli) (*types.Sbom, error) {
+	cache, err := registry.ReadImage(name, path)
 	if err != nil {
-		return nil, nil, errors.Wrap(err, "failed to download image")
+		return nil, errors.Wrap(err, "failed to read image")
 	}
-	skill.Log.Infof("Copied image")
-	return indexImage(img, image, path)
+	return indexImage(cache, cli)
 }
 
-func indexImage(img v1.Image, imageName, path string) (*types.Sbom, *v1.Image, error) {
-	// see if we can re-use an existing sbom
-	sbomPath := filepath.Join(path, "sbom.json")
-	if _, ok := os.LookupEnv("ATOMIST_NO_CACHE"); !ok {
-		if _, err := os.Stat(sbomPath); !os.IsNotExist(err) {
-			var sbom types.Sbom
-			b, err := os.ReadFile(sbomPath)
-			if err == nil {
-				err := json.Unmarshal(b, &sbom)
-				if err == nil {
-					if sbom.Descriptor.SbomVersion == internal.FromBuild().SbomVersion && sbom.Descriptor.Version == internal.FromBuild().Version {
-						skill.Log.Infof(`Indexed %d packages`, len(sbom.Artifacts))
-						return &sbom, &img, nil
-					}
-				}
-			}
+func IndexImage(image string, options IndexOptions) (*types.Sbom, error) {
+	if strings.HasPrefix(image, "sha256:") {
+		configFilePath := options.Cli.ConfigFile().Filename
+		sbomFilePath := filepath.Join(filepath.Dir(configFilePath), "scout", "sbom", "sha256", image[7:], "sbom.json")
+		if sbom := cachedSbom(sbomFilePath); sbom != nil {
+			return sbom, nil
 		}
 	}
+	cache, err := registry.SaveImage(image, options.Username, options.Password, options.Cli)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to copy image")
+	}
+	return indexImage(cache, options.Cli)
+}
 
-	lm := createLayerMapping(img)
-	skill.Log.Debugf("Created layer mapping")
+func indexImage(cache *registry.ImageCache, cli command.Cli) (*types.Sbom, error) {
+	configFilePath := cli.ConfigFile().Filename
+	sbomFilePath := filepath.Join(filepath.Dir(configFilePath), "scout", "sbom", "sha256", cache.Id[7:], "sbom.json")
+	if sbom := cachedSbom(sbomFilePath); sbom != nil {
+		return sbom, nil
+	}
 
-	skill.Log.Info("Indexing")
+	err := cache.StoreImage()
+	defer cache.Cleanup()
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to copy image")
+	}
+
+	lm, err := createLayerMapping(cache)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to index image")
+	}
+	s := internal.StartSpinner("info", "Indexing", cli.Out().IsTerminal())
+	defer s.Stop()
 	trivyResultChan := make(chan types.IndexResult)
 	syftResultChan := make(chan types.IndexResult)
-	go trivySbom(path, lm, trivyResultChan)
-	go syftSbom(path, lm, syftResultChan)
+	go trivySbom(cache, lm, trivyResultChan)
+	go syftSbom(cache, lm, syftResultChan)
 
 	trivyResult := <-trivyResultChan
 	syftResult := <-syftResultChan
 
-	var err error
-	trivyResult.Packages, err = types.NormalizePackages(trivyResult.Packages)
-	syftResult.Packages, err = types.NormalizePackages(syftResult.Packages)
-	if err != nil {
-		return nil, nil, errors.Wrapf(err, "failed to normalize packagess: %s", imageName)
+	if trivyResult.Error != nil {
+		return nil, errors.Wrap(trivyResult.Error, "failed to index image")
+	}
+	if syftResult.Error != nil {
+		return nil, errors.Wrap(syftResult.Error, "failed to index image")
 	}
 
-	packages := types.MergePackages(syftResult, trivyResult)
+	trivyResult.Packages, err = types.NormalizePackages(trivyResult.Packages)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to normalize packages: %s", cache.Name)
+	}
+	syftResult.Packages, err = types.NormalizePackages(syftResult.Packages)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to normalize packages: %s", cache.Name)
+	}
 
+	packages := types.FilterGenericPackages(types.MergePackages(syftResult, trivyResult))
+
+	s.Stop()
 	skill.Log.Infof(`Indexed %d packages`, len(packages))
 
-	manifest, _ := img.RawManifest()
-	config, _ := img.RawConfigFile()
-	c, _ := img.ConfigFile()
-	m, _ := img.Manifest()
-	d, _ := img.Digest()
+	rawManifest := cache.Source.Image.Metadata.RawManifest
+	rawConfig := cache.Source.Image.Metadata.RawConfig
 
-	var tag []string
-	if imageName != "" {
-		ref, err := name.ParseReference(imageName)
-		if err != nil {
-			return nil, nil, errors.Wrapf(err, "failed to parse reference: %s", imageName)
-		}
-		imageName = ref.Context().String()
-		if !strings.HasPrefix(ref.Identifier(), "sha256:") {
-			tag = []string{ref.Identifier()}
-		}
+	var manifest v1.Manifest
+	err = json.Unmarshal(rawManifest, &manifest)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to unmarshal manifest")
 	}
 
 	sbom := types.Sbom{
-		Artifacts: packages,
 		Source: types.Source{
 			Type: "image",
 			Image: types.ImageSource{
-				Name:        imageName,
-				Digest:      d.String(),
-				Manifest:    m,
-				Config:      c,
-				RawManifest: base64.StdEncoding.EncodeToString(manifest),
-				RawConfig:   base64.StdEncoding.EncodeToString(config),
+				Name:        cache.Name,
+				Digest:      cache.Digest,
+				Manifest:    &manifest,
+				Config:      &cache.Source.Image.Metadata.Config,
+				RawManifest: base64.StdEncoding.EncodeToString(rawManifest),
+				RawConfig:   base64.StdEncoding.EncodeToString(rawConfig),
 				Distro:      syftResult.Distro,
 				Platform: types.Platform{
-					Os:           c.OS,
-					Architecture: c.Architecture,
-					Variant:      c.Variant,
+					Os:           cache.Source.Image.Metadata.Config.OS,
+					Architecture: cache.Source.Image.Metadata.Config.Architecture,
+					Variant:      cache.Source.Image.Metadata.Config.Variant,
 				},
-				Size: m.Config.Size,
+				Size: cache.Source.Image.Metadata.Size,
 			},
 		},
+		Artifacts: packages,
+		Secrets:   trivyResult.Secrets,
 		Descriptor: types.Descriptor{
-			Name:        "docker index",
+			Name:        "docker-index",
 			Version:     internal.FromBuild().Version,
 			SbomVersion: internal.FromBuild().SbomVersion,
 		},
 	}
 
-	if len(tag) > 0 {
-		sbom.Source.Image.Tags = &tag
+	if len(cache.Tags) > 0 {
+		sbom.Source.Image.Tags = &cache.Tags
 	}
 
 	js, err := json.MarshalIndent(sbom, "", "  ")
 	if err == nil {
-		_ = os.WriteFile(sbomPath, js, 0644)
+		err = os.MkdirAll(filepath.Dir(sbomFilePath), os.ModePerm)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed create to sbom folder")
+		}
+		err = os.WriteFile(sbomFilePath, js, 0o644)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to write sbom")
+		}
 	}
 
-	return &sbom, &img, nil
+	return &sbom, nil
 }
 
-func createLayerMapping(img v1.Image) types.LayerMapping {
+func cachedSbom(sbomFilePath string) *types.Sbom {
+	// see if we can re-use an existing sbom
+	if _, ok := os.LookupEnv("ATOMIST_NO_CACHE"); !ok {
+		if _, err := os.Stat(sbomFilePath); !os.IsNotExist(err) {
+			var sbom types.Sbom
+			b, err := os.ReadFile(sbomFilePath)
+			if err == nil {
+				err := json.Unmarshal(b, &sbom)
+				if err == nil {
+					if sbom.Descriptor.SbomVersion == internal.FromBuild().SbomVersion {
+						skill.Log.Infof(`Indexed %d packages`, len(sbom.Artifacts))
+						return &sbom
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func createLayerMapping(cache *registry.ImageCache) (*types.LayerMapping, error) {
+	skill.Log.Debugf("Creating layer mapping")
 	lm := types.LayerMapping{
 		ByDiffId:        make(map[string]string, 0),
 		ByDigest:        make(map[string]string, 0),
@@ -184,21 +226,40 @@ func createLayerMapping(img v1.Image) types.LayerMapping {
 		DigestByOrdinal: make(map[int]string, 0),
 		OrdinalByDiffId: make(map[string]int, 0),
 	}
-	config, _ := img.ConfigFile()
-	diffIds := config.RootFS.DiffIDs
-	manifest, _ := img.Manifest()
-	layers := manifest.Layers
 
-	for i := range layers {
-		layer := layers[i]
-		diffId := diffIds[i]
+	rawManifest := cache.Source.Image.Metadata.RawManifest
+	rawConfig := cache.Source.Image.Metadata.RawConfig
 
-		lm.ByDiffId[diffId.String()] = layer.Digest.String()
-		lm.ByDigest[layer.Digest.String()] = diffId.String()
-		lm.OrdinalByDiffId[diffId.String()] = i
-		lm.DiffIdByOrdinal[i] = diffId.String()
-		lm.DigestByOrdinal[i] = layer.Digest.String()
+	var manifest v1.Manifest
+	err := json.Unmarshal(rawManifest, &manifest)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to unmarshal manifest")
 	}
 
-	return lm
+	var config v1.ConfigFile
+	err = json.Unmarshal(rawConfig, &config)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to unmarshal config")
+	}
+
+	layers := manifest.Layers
+	diffIds := config.RootFS.DiffIDs
+
+	li := 0
+	for i, l := range cache.Source.Image.Metadata.Config.History {
+		if !l.EmptyLayer {
+			layer := layers[li]
+			diffId := diffIds[li]
+
+			lm.ByDiffId[diffId.String()] = layer.Digest.String()
+			lm.ByDigest[layer.Digest.String()] = diffId.String()
+			lm.OrdinalByDiffId[diffId.String()] = i
+			lm.DiffIdByOrdinal[i] = diffId.String()
+			lm.DigestByOrdinal[i] = layer.Digest.String()
+			li++
+		}
+	}
+
+	skill.Log.Debugf("Created layer mapping")
+	return &lm, nil
 }

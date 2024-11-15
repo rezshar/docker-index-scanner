@@ -17,17 +17,20 @@
 package query
 
 import (
+	"context"
 	_ "embed"
 	"fmt"
 	"net/http"
 	"strings"
 
-	"github.com/docker/index-cli-plugin/internal"
-	"github.com/docker/index-cli-plugin/types"
-
-	"github.com/atomist-skills/go-skill"
+	"github.com/hasura/go-graphql-client"
 	"github.com/pkg/errors"
 	"olympos.io/encoding/edn"
+
+	"github.com/atomist-skills/go-skill"
+	"github.com/docker/index-cli-plugin/internal"
+	"github.com/docker/index-cli-plugin/internal/ddhttp"
+	"github.com/docker/index-cli-plugin/types"
 )
 
 type CveResult struct {
@@ -54,6 +57,7 @@ func CheckAuth(workspace string, apiKey string) (bool, error) {
 	if err != nil {
 		return false, errors.Wrap(err, "failed to check auth")
 	}
+	defer resp.Body.Close() //nolint:errcheck
 	if resp.StatusCode != 200 || err != nil {
 		return false, nil
 	}
@@ -75,18 +79,29 @@ func QueryCves(sb *types.Sbom, cve string, workspace string, apiKey string) (*[]
 		name = "cve_query"
 	}
 	resp, err := query(q, name, workspace, apiKey)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to run query")
+	}
 	var result QueryResult
+	defer resp.Body.Close() //nolint:errcheck
 	err = edn.NewDecoder(resp.Body).Decode(&result)
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to unmarshal response")
 	}
 	if len(result.Query.Data) > 0 {
-		if len(result.Query.Data) == 1 {
+		if len(result.Query.Data[0].Cves) == 1 {
 			skill.Log.Infof("Detected %d vulnerability", len(result.Query.Data[0].Cves))
 		} else {
 			skill.Log.Infof("Detected %d vulnerabilities", len(result.Query.Data[0].Cves))
 		}
-		return &result.Query.Data[0].Cves, nil
+		fcves := internal.UniqueBy(result.Query.Data[0].Cves, func(cve types.Cve) string {
+			if cve.Cve != nil {
+				return fmt.Sprintf("%s %s", cve.Purl, cve.Cve.SourceId)
+			} else {
+				return fmt.Sprintf("%s %s", cve.Purl, cve.Advisory.SourceId)
+			}
+		})
+		return &fcves, nil
 	} else {
 		return nil, nil
 	}
@@ -96,10 +111,10 @@ func query(query string, name string, workspace string, apiKey string) (*http.Re
 	url := fmt.Sprintf("https://api.dso.docker.com/datalog/team/%s/queries", workspace)
 	if workspace == "" || apiKey == "" {
 		url = "https://api.dso.docker.com/datalog/shared-vulnerability/queries"
-
 	}
 	query = fmt.Sprintf(`{:queries [{:name "query" :query %s}]}`, query)
-	client := &http.Client{}
+	skill.Log.Debugf("Query %s", query)
+	client := ddhttp.DefaultClient()
 	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(query))
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to create http request")
@@ -117,5 +132,34 @@ func query(query string, name string, workspace string, apiKey string) (*http.Re
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to run query")
 	}
+	skill.Log.Debugf("Query response %s", resp.Status)
 	return resp, nil
+}
+
+func ForVulnerabilitiesInGraphQL(sb *types.Sbom) (*types.VulnerabilitiesByPurls, error) {
+	url := "https://api.dso.docker.com/v1/graphql"
+	client := graphql.NewClient(url, ddhttp.DefaultClient())
+
+	purls := make([]string, 0)
+	for _, p := range sb.Artifacts {
+		purls = append(purls, p.Purl)
+	}
+
+	variables := map[string]interface{}{
+		"purls": purls,
+	}
+
+	var q types.VulnerabilitiesByPurls
+	err := client.Query(context.Background(), &q, variables)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to run query")
+	}
+	if len(q.VulnerabilitiesByPackage) > 0 {
+		if len(q.VulnerabilitiesByPackage) == 1 {
+			skill.Log.Infof("Detected 1 vulnerable package")
+		} else {
+			skill.Log.Infof("Detected %d vulnerable packages", len(q.VulnerabilitiesByPackage))
+		}
+	}
+	return &q, nil
 }
